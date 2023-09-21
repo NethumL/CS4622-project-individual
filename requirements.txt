@@ -1,0 +1,7 @@
+numpy
+pandas
+matplotlib
+seaborn
+sklearn==1.2.2
+joblib
+catboost==1.2
