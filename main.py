@@ -31,6 +31,7 @@ import numpy as np
 class Label(Enum):
     """Labels of datasets"""
 
+    C = "common"
     L1 = "label_1"
     L2 = "label_2"
     L3 = "label_3"
@@ -53,7 +54,7 @@ class K(Enum):
 
 
 ID = "ID"
-LABELS = [l.value for l in Label]
+LABELS = [l.value for l in Label if l != Label.C]
 AGE_LABEL = Label.L2
 FEATURE_COUNT = 768
 FEATURES = [f"feature_{i}" for i in range(1, FEATURE_COUNT + 1)]
@@ -113,12 +114,10 @@ data[L.C2][K.TRAIN][LABELS + FEATURES[::32]].describe()
 # In[ ]:
 
 
-from sklearn.preprocessing import RobustScaler
-
 LDfs = Dict[L, Dict[Label, pd.DataFrame]]
 LSer = Dict[L, Dict[Label, pd.Series]]
 
-# To store datasets for each label
+# To store datasets
 X_train: LDfs = {L.C1: {}, L.C2: {}}
 X_valid: LDfs = {L.C1: {}, L.C2: {}}
 X_test: LDfs = {L.C1: {}, L.C2: {}}
@@ -126,7 +125,6 @@ y_train: LSer = {L.C1: {}, L.C2: {}}
 y_valid: LSer = {L.C1: {}, L.C2: {}}
 y_pred_before: LSer = {L.C1: {}, L.C2: {}}
 y_pred_after: LSer = {L.C1: {}, L.C2: {}}
-scalers: Dict[L, Dict[Label, RobustScaler]] = {L.C1: {}, L.C2: {}}
 
 
 def filter_missing_age(df: pd.DataFrame):
@@ -134,7 +132,7 @@ def filter_missing_age(df: pd.DataFrame):
     return df[df[AGE_LABEL.value].notna()]
 
 
-# Filter `NaN` and scale datasets
+# Separately store datasets
 for layer in L:
     try:
         train_df = data[layer][K.TRAIN]
@@ -142,19 +140,28 @@ for layer in L:
         test_df = data[layer][K.TEST]
     except:
         print(layer, "not found")
-    for target_label in Label:
+
+    X_train[layer][Label.C] = train_df.drop(LABELS, axis=1)
+    X_valid[layer][Label.C] = valid_df.drop(LABELS, axis=1)
+    X_test[layer][Label.C] = test_df.copy()
+
+    for target_label in [Label.L1, Label.L2, Label.L3, Label.L4]:
         tr_df = filter_missing_age(train_df) if target_label == AGE_LABEL else train_df
         vl_df = filter_missing_age(valid_df) if target_label == AGE_LABEL else valid_df
         ts_df = test_df  # No need to filter rows with missing age in test dataset
 
-        scaler = RobustScaler()
-        scaler.fit(tr_df.drop(LABELS, axis=1))
-        X_train[layer][target_label] = tr_df.drop(LABELS, axis=1)
+        if target_label == AGE_LABEL:
+            X_train[layer][target_label] = tr_df.drop(LABELS, axis=1)
+            X_valid[layer][target_label] = vl_df.drop(LABELS, axis=1)
+            X_test[layer][target_label] = ts_df.copy()
+        else:
+            # Only references to common dataframes
+            X_train[layer][target_label] = X_train[layer][Label.C]
+            X_valid[layer][target_label] = X_valid[layer][Label.C]
+            X_test[layer][target_label] = X_test[layer][Label.C]
+
         y_train[layer][target_label] = tr_df[target_label.value]
-        X_valid[layer][target_label] = vl_df.drop(LABELS, axis=1)
         y_valid[layer][target_label] = vl_df[target_label.value]
-        X_test[layer][target_label] = ts_df.copy()
-        scalers[layer][target_label] = scaler
 
 del data
 gc.collect()
@@ -177,8 +184,9 @@ y_train[L.C1][Label.L1].head()
 # In[ ]:
 
 
-from sklearn import svm
 from catboost import CatBoostClassifier
+from sklearn import svm
+from sklearn.base import BaseEstimator
 
 
 # ### Predicting labels and showing statistics
@@ -232,7 +240,6 @@ def load_model(name: str):
 
 
 from sklearn.model_selection import cross_val_score
-from sklearn.base import BaseEstimator
 
 
 def cross_validate(model: BaseEstimator, X: pd.DataFrame, y: pd.Series, cv=5):
@@ -251,7 +258,6 @@ def cross_validate(model: BaseEstimator, X: pd.DataFrame, y: pd.Series, cv=5):
 
 
 from sklearn.model_selection import GridSearchCV
-from sklearn.base import BaseEstimator
 
 DEFAULT_SVC_PARAMS = {
     "C": [1, 10, 100, 1000],
@@ -416,14 +422,15 @@ y_pred_before[L.C2][Label.L4] = model.predict(X_test[L.C2][Label.L4].drop(ID, ax
 
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
 
 
-def get_pca(n_components=0.95):
-    return PCA(n_components=n_components, svd_solver="full", random_state=RNG)
+def get_pca(pca_variance=0.95):
+    return PCA(n_components=pca_variance, svd_solver="full", random_state=RNG)
 
 
-def get_transformers(pca_count=5, n_components=0.95):
-    return [(f"pca_{i}", get_pca(n_components)) for i in range(pca_count)]
+def get_transformers(pca_count=5, pca_variance=0.95):
+    return [(f"pca_{i}", get_pca(pca_variance)) for i in range(pca_count)]
 
 
 # ### Competition 1 (layer 7)
@@ -431,12 +438,12 @@ def get_transformers(pca_count=5, n_components=0.95):
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     model = svm.SVC(kernel="rbf", C=100, gamma=0.0001, random_state=RNG)
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C1][Label.L1]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -453,12 +460,12 @@ y_pred_after[L.C1][Label.L1] = pipeline.predict(X_test[L.C1][Label.L1].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     model = svm.SVC(kernel="rbf", C=10, gamma="auto", random_state=RNG)
     pipeline = Pipeline(
         [
-            # ("scaler", scalers[L.C1][Label.L2]),
+            # ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -475,13 +482,13 @@ y_pred_after[L.C1][Label.L2] = pipeline.predict(X_test[L.C1][Label.L2].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     # model = svm.SVC(kernel="rbf", C=100, gamma='scale', random_state=RNG, verbose=True)
     model = svm.SVC(kernel="rbf", random_state=RNG)
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C1][Label.L3]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -498,13 +505,13 @@ y_pred_after[L.C1][Label.L3] = pipeline.predict(X_test[L.C1][Label.L3].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     # model = svm.SVC(kernel="rbf", class_weight="balanced", random_state=RNG)  # 5m
     model = svm.SVC(kernel="rbf", gamma="auto", random_state=RNG)  # 2m
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C1][Label.L4]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -523,14 +530,14 @@ y_pred_after[L.C1][Label.L4] = pipeline.predict(X_test[L.C1][Label.L4].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     model = svm.SVC(kernel="rbf", C=1000, gamma="scale", random_state=RNG)  # 89%
     # model = svm.SVC(kernel="rbf", C=1000, gamma=0.0001, random_state=RNG)  # 86%
     # model = CatBoostClassifier(random_state=RNG_SEED)  # 86%
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C2][Label.L1]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -547,14 +554,13 @@ y_pred_after[L.C2][Label.L1] = pipeline.predict(X_test[L.C2][Label.L1].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
-RETRAIN = True
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     # model = svm.SVC(kernel="rbf", C=100, gamma='scale', random_state=RNG)
     model = CatBoostClassifier(random_state=RNG_SEED)  # 4m
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C2][Label.L2]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -571,13 +577,13 @@ y_pred_after[L.C2][Label.L2] = pipeline.predict(X_test[L.C2][Label.L2].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     # model = CatBoostClassifier(iterations=300, loss_function="MultiClass", max_depth=6, random_state=RNG_SEED)
     model = svm.SVC(kernel="rbf", gamma="scale", C=1, random_state=RNG)  # 20s
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C2][Label.L3]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -594,13 +600,13 @@ y_pred_after[L.C2][Label.L3] = pipeline.predict(X_test[L.C2][Label.L3].drop(ID, 
 # In[ ]:
 
 
-transformers = get_transformers(pca_count=1)
 if RETRAIN:
+    transformers = get_transformers(pca_count=1)
     model = svm.SVC(kernel="rbf", C=100, class_weight="balanced", random_state=RNG)
     # model = CatBoostClassifier(random_state=RNG_SEED)
     pipeline = Pipeline(
         [
-            ("scaler", scalers[L.C2][Label.L4]),
+            ("scaler", RobustScaler()),
             *transformers,
             ("clf", model),
         ]
@@ -665,10 +671,4 @@ result1.to_csv("results/layer-7.csv", index=False)
 
 
 result2.to_csv("results/layer-12.csv", index=False)
-
-
-# In[ ]:
-
-
-
 
