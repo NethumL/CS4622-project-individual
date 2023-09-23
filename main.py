@@ -18,9 +18,10 @@
 
 # ## Loading and inspecting data
 
-# In[20]:
+# In[ ]:
 
 
+import gc
 from enum import Enum
 from typing import Dict
 
@@ -59,15 +60,14 @@ FEATURES = [f"feature_{i}" for i in range(1, FEATURE_COUNT + 1)]
 RETRAIN = True  # Retrain the model or load the saved one
 VERBOSE = True
 RNG_SEED = 42
+RNG = np.random.RandomState(RNG_SEED)
 
 DATA_C1 = "data/layer-7"
 DATA_C2 = "data/layer-12"
 MODEL_DIR = "models"
 
-RNG = np.random.RandomState(RNG_SEED)
 
-
-# In[21]:
+# In[ ]:
 
 
 def log(*args, **kwargs):
@@ -75,7 +75,7 @@ def log(*args, **kwargs):
         print(*args, **kwargs)
 
 
-# In[22]:
+# In[ ]:
 
 
 import pandas as pd
@@ -87,7 +87,7 @@ data[L.C1][K.TEST] = pd.read_csv(f"{DATA_C1}/test.csv")
 data[L.C1][K.TRAIN].head()
 
 
-# In[23]:
+# In[ ]:
 
 
 data[L.C2][K.TRAIN] = pd.read_csv(f"{DATA_C2}/train.csv")
@@ -96,21 +96,21 @@ data[L.C2][K.TEST] = pd.read_csv(f"{DATA_C2}/test.csv")
 data[L.C2][K.TRAIN].head()
 
 
-# In[24]:
+# In[ ]:
+
+
+data[L.C1][K.TRAIN][LABELS + FEATURES[::32]].describe()
+
+
+# In[ ]:
 
 
 data[L.C2][K.TRAIN][LABELS + FEATURES[::32]].describe()
 
 
-# In[25]:
-
-
-data[L.C2][K.VALID][LABELS + FEATURES[::32]].describe()
-
-
 # ## Preprocessing
 
-# In[26]:
+# In[ ]:
 
 
 from sklearn.preprocessing import RobustScaler
@@ -126,6 +126,7 @@ y_train: LSer = {L.C1: {}, L.C2: {}}
 y_valid: LSer = {L.C1: {}, L.C2: {}}
 y_pred_before: LSer = {L.C1: {}, L.C2: {}}
 y_pred_after: LSer = {L.C1: {}, L.C2: {}}
+scalers: Dict[L, Dict[Label, RobustScaler]] = {L.C1: {}, L.C2: {}}
 
 
 def filter_missing_age(df: pd.DataFrame):
@@ -134,7 +135,7 @@ def filter_missing_age(df: pd.DataFrame):
 
 
 # Filter `NaN` and scale datasets
-for layer in [L.C1, L.C2]:
+for layer in L:
     try:
         train_df = data[layer][K.TRAIN]
         valid_df = data[layer][K.VALID]
@@ -148,28 +149,24 @@ for layer in [L.C1, L.C2]:
 
         scaler = RobustScaler()
         scaler.fit(tr_df.drop(LABELS, axis=1))
-        X_train[layer][target_label] = pd.DataFrame(
-            scaler.transform(tr_df.drop(LABELS, axis=1)), columns=FEATURES
-        )
+        X_train[layer][target_label] = tr_df.drop(LABELS, axis=1)
         y_train[layer][target_label] = tr_df[target_label.value]
-        X_valid[layer][target_label] = pd.DataFrame(
-            scaler.transform(vl_df.drop(LABELS, axis=1)), columns=FEATURES
-        )
+        X_valid[layer][target_label] = vl_df.drop(LABELS, axis=1)
         y_valid[layer][target_label] = vl_df[target_label.value]
-        X_test[layer][target_label] = pd.DataFrame(
-            scaler.transform(ts_df.drop(ID, axis=1)), columns=FEATURES
-        )
-        X_test[layer][target_label][ID] = ts_df[ID]
+        X_test[layer][target_label] = ts_df.copy()
+        scalers[layer][target_label] = scaler
+
 del data
+gc.collect()
 
 
-# In[27]:
+# In[ ]:
 
 
 X_train[L.C1][Label.L1].head()
 
 
-# In[28]:
+# In[ ]:
 
 
 y_train[L.C1][Label.L1].head()
@@ -177,7 +174,7 @@ y_train[L.C1][Label.L1].head()
 
 # ## Model training
 
-# In[29]:
+# In[ ]:
 
 
 from sklearn import svm
@@ -186,7 +183,7 @@ from catboost import CatBoostClassifier
 
 # ### Predicting labels and showing statistics
 
-# In[30]:
+# In[ ]:
 
 
 from sklearn import metrics
@@ -212,7 +209,7 @@ def predict(model, X_test: pd.DataFrame, y_test: pd.Series):
 
 # ### Saving models
 
-# In[31]:
+# In[ ]:
 
 
 import joblib
@@ -231,16 +228,16 @@ def load_model(name: str):
 
 # ### Cross validation
 
-# In[32]:
+# In[ ]:
 
 
 from sklearn.model_selection import cross_val_score
 from sklearn.base import BaseEstimator
 
 
-def cross_validate(model: BaseEstimator, X: pd.DataFrame, y: pd.Series):
+def cross_validate(model: BaseEstimator, X: pd.DataFrame, y: pd.Series, cv=5):
     log("Cross validating...")
-    scores = cross_val_score(model, X, y, cv=5, n_jobs=-1)
+    scores = cross_val_score(model, X, y, cv=cv, n_jobs=-1, verbose=1)
     print(
         "%0.2f accuracy with a standard deviation of %0.2f"
         % (scores.mean(), scores.std())
@@ -250,32 +247,38 @@ def cross_validate(model: BaseEstimator, X: pd.DataFrame, y: pd.Series):
 
 # ### Hyperparameter tuning
 
-# In[33]:
+# In[ ]:
 
 
-from sklearn.experimental import enable_halving_search_cv
-from sklearn.model_selection import HalvingGridSearchCV
+from sklearn.model_selection import GridSearchCV
+from sklearn.base import BaseEstimator
+
+DEFAULT_SVC_PARAMS = {
+    "C": [1, 10, 100, 1000],
+    "gamma": ["scale", "auto", 1, 0.01, 0.0001],
+}
 
 
-def tune(base_estimator, X, y, param_grid: dict = {}, n_jobs=10):
-    """Tunes the hyperparameters of `base_estimator` using `HalvingGridSearchCV`"""
+def tune(
+    base_estimator: BaseEstimator,
+    X: pd.DataFrame,
+    y: pd.Series,
+    param_grid: dict = DEFAULT_SVC_PARAMS,
+    n_jobs=10,
+    cv=5,
+):
+    """Tunes the hyperparameters of `base_estimator` using `GridSearchCV`"""
     log("Tuning...")
-    if len(param_grid) == 0:
-        param_grid = {
-            "C": [1, 10, 100, 1000],
-            "gamma": ["scale", "auto", 1, 0.01, 0.0001],
-        }
-    verbosity = 2 if VERBOSE else 0
-    sh = HalvingGridSearchCV(
+    verbosity = 4 if VERBOSE else 0
+    sh = GridSearchCV(
         base_estimator,
         param_grid,
-        cv=5,
-        factor=2,
+        cv=cv,
         n_jobs=n_jobs,
         verbose=verbosity,
-        random_state=RNG,
     ).fit(X, y)
     print(sh.best_params_)
+    return sh.best_estimator_
 
 
 # ## Training baseline models
@@ -304,7 +307,7 @@ y_pred_before[L.C1][Label.L1] = model.predict(X_test[L.C1][Label.L1].drop(ID, ax
 
 if RETRAIN:
     model = svm.SVC(kernel="rbf", random_state=RNG)
-    model.fit(X_train[L.C1][Label.L2], y_train[L.C1][Label.L2], C=1000)
+    model.fit(X_train[L.C1][Label.L2], y_train[L.C1][Label.L2])
     save_model(model, "c1_label_2_before")
 else:
     model = load_model("c1_label_2_before")
@@ -380,7 +383,7 @@ y_pred_before[L.C2][Label.L2] = model.predict(X_test[L.C2][Label.L2].drop(ID, ax
 # C2, L3
 
 if RETRAIN:
-    model = svm.SVC(kernel="linear")
+    model = svm.SVC(kernel="rbf")
     model.fit(X_train[L.C2][Label.L3], y_train[L.C2][Label.L3])
     save_model(model, "c2_label_3_before")
 else:
@@ -395,7 +398,7 @@ y_pred_before[L.C2][Label.L3] = model.predict(X_test[L.C2][Label.L3].drop(ID, ax
 # C2, L4
 
 if RETRAIN:
-    model = svm.SVC(kernel="linear", class_weight="balanced")
+    model = svm.SVC(kernel="rbf", class_weight="balanced")
     model.fit(X_train[L.C2][Label.L4], y_train[L.C2][Label.L4])
     save_model(model, "c2_label_4_before")
 else:
@@ -408,90 +411,19 @@ y_pred_before[L.C2][Label.L4] = model.predict(X_test[L.C2][Label.L4].drop(ID, ax
 
 # ### Feature engineering functions
 
-# In[15]:
+# In[ ]:
 
 
 from sklearn.decomposition import PCA
-from sklearn.ensemble import ExtraTreesClassifier
-from sklearn.experimental import enable_halving_search_cv  # noqa
-from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
+from sklearn.pipeline import Pipeline
 
 
-def fit_and_transform_pca(*X: pd.DataFrame):
-    pca = PCA(n_components=0.95, svd_solver="full", random_state=RNG)
-    pca.fit(X[0])
-    X_trf = list(map(lambda x: pd.DataFrame(pca.transform(x)), X))
-    print("Shape after PCA:", X_trf[0].shape)
-    return pca, *X_trf
+def get_pca(n_components=0.95):
+    return PCA(n_components=n_components, svd_solver="full", random_state=RNG)
 
 
-def univariate_feature_selection(X: pd.DataFrame, y: pd.Series, feature_count=30):
-    FROM_MODEL = False
-    if FROM_MODEL:
-        clf = ExtraTreesClassifier(n_estimators=50, random_state=RNG)
-        clf = clf.fit(X, y)
-        selector = SelectFromModel(clf, prefit=True)
-    else:
-        score_func = f_classif
-        selector = SelectKBest(score_func, k=feature_count)
-        selector = selector.fit(X, y)
-    X_new = selector.transform(X)
-    print("Shape after univariate:", X_new.shape)
-    return selector, X_new
-
-
-def combine_transformers(*transformers):
-    def combined_transform(X):
-        for transformer in transformers:
-            X = transformer.transform(X)
-        return X
-
-    return combined_transform
-
-
-def transform(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_valid: pd.DataFrame,
-    X_test: pd.DataFrame,
-    pca_count=5,
-    feature_drop=0,
-):
-    if pca_count > 0:
-        log("Running PCA...")
-        transformers = [None for _ in range(pca_count)]
-        transformers[0], X_train_trf, X_valid_trf, X_test_trf = fit_and_transform_pca(
-            X_train, X_valid, X_test
-        )
-    else:
-        log("Skipping PCA...")
-        transformers = []
-        X_train_trf, X_valid_trf, X_test_trf = X_train, X_valid, X_test
-
-    # Skip univariate feature selection if `feature_drop` is specified as 0
-    if feature_drop != 0:
-        log("Running univariate feature selection...")
-        current_feature_count = X_train_trf.shape[1]
-        selector, X_train_trf = univariate_feature_selection(
-            X_train_trf,
-            y_train,
-            feature_count=current_feature_count - feature_drop,
-        )
-        X_valid_trf = pd.DataFrame(selector.transform(X_valid_trf))
-        X_test_trf = pd.DataFrame(selector.transform(X_test_trf))
-        transformers.append(selector)
-
-    if pca_count > 1:
-        log(f"Running PCA {pca_count - 1} times...")
-        for i in range(pca_count - 1):
-            (
-                transformers[i + 1],
-                X_train_trf,
-                X_valid_trf,
-                X_test_trf,
-            ) = fit_and_transform_pca(X_train_trf, X_valid_trf, X_test_trf)
-
-    return X_train_trf, X_valid_trf, X_test_trf, combine_transformers(*transformers)
+def get_transformers(pca_count=5, n_components=0.95):
+    return [(f"pca_{i}", get_pca(n_components)) for i in range(pca_count)]
 
 
 # ### Competition 1 (layer 7)
@@ -499,99 +431,91 @@ def transform(
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C1][Label.L1],
-    y_train[L.C1][Label.L1],
-    X_valid[L.C1][Label.L1],
-    X_test[L.C1][Label.L1].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    param_grid = {
-        "iterations": [100, 200, 300],
-        "loss_function": ["MultiClass"],
-        "max_depth": range(4, 10, 2),
-    }
-    # model = svm.SVC(kernel="rbf", C=100, gamma=0.0001, random_state=RNG)
-    model = CatBoostClassifier(iterations=100, depth=6, random_state=RNG_SEED)
-    # tune(model, X_train_trf, y_train[L.C1][Label.L1], param_grid=param_grid)
+    model = svm.SVC(kernel="rbf", C=100, gamma=0.0001, random_state=RNG)
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C1][Label.L1]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C1][Label.L1])
-    save_model(model, "c1_label_1_after")
+    pipeline.fit(X_train[L.C1][Label.L1], y_train[L.C1][Label.L1])  # 40s
+    save_model(pipeline, "c1_label_1_after")
 else:
-    model = load_model("c1_label_1_after")
-predict(model, X_valid_trf, y_valid[L.C1][Label.L1])
-y_pred_after[L.C1][Label.L1] = model.predict(X_test_trf)
+    pipeline = load_model("c1_label_1_after")
+predict(pipeline, X_valid[L.C1][Label.L1], y_valid[L.C1][Label.L1])
+y_pred_after[L.C1][Label.L1] = pipeline.predict(X_test[L.C1][Label.L1].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C1][Label.L2],
-    y_train[L.C1][Label.L2],
-    X_valid[L.C1][Label.L2],
-    X_test[L.C1][Label.L2].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    model = svm.SVC(kernel="rbf", C=1000, gamma=0.0001, random_state=RNG, verbose=True)
-    # tune(model, X_train_trf, y_train[L.C1][Label.L3])
+    model = svm.SVC(kernel="rbf", C=10, gamma="auto", random_state=RNG)
+    pipeline = Pipeline(
+        [
+            # ("scaler", scalers[L.C1][Label.L2]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C1][Label.L2])
-    # save_model(model, "c1_label_2_after")
+    pipeline.fit(X_train[L.C1][Label.L2], y_train[L.C1][Label.L2])  # 1m 50s
+    save_model(pipeline, "c1_label_2_after")
 else:
-    model = load_model("c1_label_2_after")
-predict(model, X_valid_trf, y_valid[L.C1][Label.L2])
-y_pred_after[L.C1][Label.L2] = model.predict(X_test_trf)
+    pipeline = load_model("c1_label_2_after")
+predict(pipeline, X_valid[L.C1][Label.L2], y_valid[L.C1][Label.L2])
+y_pred_after[L.C1][Label.L2] = pipeline.predict(X_test[L.C1][Label.L2].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C1][Label.L3],
-    y_train[L.C1][Label.L3],
-    X_valid[L.C1][Label.L3],
-    X_test[L.C1][Label.L3].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
     # model = svm.SVC(kernel="rbf", C=100, gamma='scale', random_state=RNG, verbose=True)
-    model = svm.SVC(kernel="rbf", random_state=RNG, verbose=True)
-    # tune(model, X_train_trf, y_train[L.C1][Label.L3])
+    model = svm.SVC(kernel="rbf", random_state=RNG)
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C1][Label.L3]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C1][Label.L3])
-    save_model(model, "c1_label_3_after")
+    pipeline.fit(X_train[L.C1][Label.L3], y_train[L.C1][Label.L3])  # 40s
+    save_model(pipeline, "c1_label_3_after")
 else:
-    model = load_model("c1_label_3_after")
-predict(model, X_valid_trf, y_valid[L.C1][Label.L3])
-y_pred_after[L.C1][Label.L3] = model.predict(X_test_trf)
+    pipeline = load_model("c1_label_3_after")
+predict(pipeline, X_valid[L.C1][Label.L3], y_valid[L.C1][Label.L3])
+y_pred_after[L.C1][Label.L3] = pipeline.predict(X_test[L.C1][Label.L3].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C1][Label.L4],
-    y_train[L.C1][Label.L4],
-    X_valid[L.C1][Label.L4],
-    X_test[L.C1][Label.L4].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    model = svm.SVC(kernel="rbf", class_weight="balanced", random_state=RNG, verbose=True)
+    # model = svm.SVC(kernel="rbf", class_weight="balanced", random_state=RNG)  # 5m
+    model = svm.SVC(kernel="rbf", gamma="auto", random_state=RNG)  # 2m
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C1][Label.L4]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C1][Label.L4])
-    save_model(model, "c1_label_4_after")
+    pipeline.fit(X_train[L.C1][Label.L4], y_train[L.C1][Label.L4])  # 2m
+    save_model(pipeline, "c1_label_4_after")
 else:
-    model = load_model("c1_label_4_after")
-predict(model, X_valid_trf, y_valid[L.C1][Label.L4])
-y_pred_after[L.C1][Label.L4] = model.predict(X_test_trf)
+    pipeline = load_model("c1_label_4_after")
+predict(pipeline, X_valid[L.C1][Label.L4], y_valid[L.C1][Label.L4])
+y_pred_after[L.C1][Label.L4] = pipeline.predict(X_test[L.C1][Label.L4].drop(ID, axis=1))
 
 
 # ### Competition 2 (layer 12)
@@ -599,108 +523,98 @@ y_pred_after[L.C1][Label.L4] = model.predict(X_test_trf)
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C2][Label.L1],
-    y_train[L.C2][Label.L1],
-    X_valid[L.C2][Label.L1],
-    X_test[L.C2][Label.L1].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    # model = svm.SVC(kernel="rbf", C=1000, gamma="scale", random_state=RNG)
-    model = CatBoostClassifier(random_state=RNG_SEED)
-    # param_grid = {
-    #     "iterations": [100, 200, 300],
-    #     "depth": [4, 6, 8],
-    # }
-    # tune(model, X_train_trf, y_train[L.C2][Label.L1], param_grid=param_grid)
+    model = svm.SVC(kernel="rbf", C=1000, gamma="scale", random_state=RNG)  # 89%
+    # model = svm.SVC(kernel="rbf", C=1000, gamma=0.0001, random_state=RNG)  # 86%
+    # model = CatBoostClassifier(random_state=RNG_SEED)  # 86%
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C2][Label.L1]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C2][Label.L1])
-    save_model(model, "c2_label_1_after")
+    pipeline.fit(X_train[L.C2][Label.L1], y_train[L.C2][Label.L1])  # 40s
+    save_model(pipeline, "c2_label_1_after")
 else:
-    model = load_model("c2_label_1_after")
-predict(model, X_valid_trf, y_valid[L.C2][Label.L1])
-y_pred_after[L.C2][Label.L1] = model.predict(X_test_trf)
+    pipeline = load_model("c2_label_1_after")
+predict(pipeline, X_valid[L.C2][Label.L1], y_valid[L.C2][Label.L1])
+y_pred_after[L.C2][Label.L1] = pipeline.predict(X_test[L.C2][Label.L1].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C2][Label.L2],
-    y_train[L.C2][Label.L2],
-    X_valid[L.C2][Label.L2],
-    X_test[L.C2][Label.L2].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
-
+transformers = get_transformers(pca_count=1)
+RETRAIN = True
 if RETRAIN:
-    model = CatBoostClassifier(random_state=RNG_SEED)
     # model = svm.SVC(kernel="rbf", C=100, gamma='scale', random_state=RNG)
-    # tune(model, X_train_trf, y_train[L.C2][Label.L2])
+    model = CatBoostClassifier(random_state=RNG_SEED)  # 4m
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C2][Label.L2]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C2][Label.L2])
-    save_model(model, "c2_label_2_after")
+    pipeline.fit(X_train[L.C2][Label.L2], y_train[L.C2][Label.L2])  # 4m
+    save_model(pipeline, "c2_label_2_after")
 else:
-    model = load_model("c2_label_2_after")
-predict(model, X_valid_trf, y_valid[L.C2][Label.L2])
-y_pred_after[L.C2][Label.L2] = model.predict(X_test_trf)
+    pipeline = load_model("c2_label_2_after")
+predict(pipeline, X_valid[L.C2][Label.L2], y_valid[L.C2][Label.L2])
+y_pred_after[L.C2][Label.L2] = pipeline.predict(X_test[L.C2][Label.L2].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C2][Label.L3],
-    y_train[L.C2][Label.L3],
-    X_valid[L.C2][Label.L3],
-    X_test[L.C2][Label.L3].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    param_grid = {
-        "iterations": [100, 200, 300],
-        "loss_function": ["MultiClass"],
-        "max_depth": range(4, 10, 2),
-    }
-    model = CatBoostClassifier(iterations=300, loss_function="MultiClass", max_depth=6, random_state=RNG_SEED)
-    # model = svm.SVC(kernel="rbf", C=10, random_state=RNG)
-    # tune(model, X_train_trf, y_train[L.C2][Label.L3], param_grid=param_grid)
+    # model = CatBoostClassifier(iterations=300, loss_function="MultiClass", max_depth=6, random_state=RNG_SEED)
+    model = svm.SVC(kernel="rbf", gamma="scale", C=1, random_state=RNG)  # 20s
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C2][Label.L3]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C2][Label.L3])
-    save_model(model, "c2_label_3_after")
+    pipeline.fit(X_train[L.C2][Label.L3], y_train[L.C2][Label.L3])  # 20s
+    save_model(pipeline, "c2_label_3_after")
 else:
-    model = load_model("c2_label_3_after")
-predict(model, X_valid_trf, y_valid[L.C2][Label.L3])
-y_pred_after[L.C2][Label.L3] = model.predict(X_test_trf)
+    pipeline = load_model("c2_label_3_after")
+predict(pipeline, X_valid[L.C2][Label.L3], y_valid[L.C2][Label.L3])
+y_pred_after[L.C2][Label.L3] = pipeline.predict(X_test[L.C2][Label.L3].drop(ID, axis=1))
 
 
 # In[ ]:
 
 
-X_train_trf, X_valid_trf, X_test_trf, selector = transform(
-    X_train[L.C2][Label.L4],
-    y_train[L.C2][Label.L4],
-    X_valid[L.C2][Label.L4],
-    X_test[L.C2][Label.L4].drop(ID, axis=1),
-    pca_count=1,
-    feature_drop=0,
-)
+transformers = get_transformers(pca_count=1)
 if RETRAIN:
-    # model = svm.SVC(kernel="rbf", C=100, class_weight="balanced", verbose=True, random_state=RNG)
-    model = CatBoostClassifier(random_state=RNG_SEED)
-    # tune(model, X_train_trf, y_train[L.C2][Label.L4])
+    model = svm.SVC(kernel="rbf", C=100, class_weight="balanced", random_state=RNG)
+    # model = CatBoostClassifier(random_state=RNG_SEED)
+    pipeline = Pipeline(
+        [
+            ("scaler", scalers[L.C2][Label.L4]),
+            *transformers,
+            ("clf", model),
+        ]
+    )
     log("Training...")
-    model.fit(X_train_trf, y_train[L.C2][Label.L4])
-    save_model(model, "c2_label_4_after")
+    pipeline.fit(X_train[L.C2][Label.L4], y_train[L.C2][Label.L4])  # 1m
+    save_model(pipeline, "c2_label_4_after")
 else:
-    model = load_model("c2_label_4_after")
-predict(model, X_valid_trf, y_valid[L.C2][Label.L4])
-y_pred_after[L.C2][Label.L4] = model.predict(X_test_trf)
+    pipeline = load_model("c2_label_4_after")
+predict(pipeline, X_valid[L.C2][Label.L4], y_valid[L.C2][Label.L4])
+y_pred_after[L.C2][Label.L4] = pipeline.predict(X_test[L.C2][Label.L4].drop(ID, axis=1))
 
+
+# ## Results
 
 # In[ ]:
 
