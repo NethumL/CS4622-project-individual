@@ -5,6 +5,7 @@ seaborn
 sklearn==1.2.2
 joblib
 catboost==1.2
+lime==0.2.0.1
 
 # Types
 pandas-stubs

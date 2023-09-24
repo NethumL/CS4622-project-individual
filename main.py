@@ -440,7 +440,7 @@ def get_transformers(pca_count=5, pca_variance=0.95):
 
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
-    model = svm.SVC(kernel="rbf", C=100, gamma=0.0001, random_state=RNG)
+    model = svm.SVC(kernel="rbf", C=100, gamma=0.0001, random_state=RNG, probability=True)
     pipeline = Pipeline(
         [
             ("scaler", RobustScaler()),
@@ -508,7 +508,7 @@ y_pred_after[L.C1][Label.L3] = pipeline.predict(X_test[L.C1][Label.L3].drop(ID, 
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
     # model = svm.SVC(kernel="rbf", class_weight="balanced", random_state=RNG)  # 5m
-    model = svm.SVC(kernel="rbf", gamma="auto", random_state=RNG)  # 2m
+    model = svm.SVC(kernel="rbf", gamma="auto", random_state=RNG, probability=True)  # 2m
     pipeline = Pipeline(
         [
             ("scaler", RobustScaler()),
@@ -530,11 +530,14 @@ y_pred_after[L.C1][Label.L4] = pipeline.predict(X_test[L.C1][Label.L4].drop(ID, 
 # In[ ]:
 
 
+# from sklearn.ensemble import RandomForestClassifier
+
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
-    model = svm.SVC(kernel="rbf", C=1000, gamma="scale", random_state=RNG)  # 89%
+    model = svm.SVC(kernel="rbf", C=1000, gamma="scale", random_state=RNG, probability=True)  # 89%
     # model = svm.SVC(kernel="rbf", C=1000, gamma=0.0001, random_state=RNG)  # 86%
     # model = CatBoostClassifier(random_state=RNG_SEED)  # 86%
+    # model = RandomForestClassifier(n_estimators=200, max_depth=50, n_jobs=-1, random_state=RNG)
     pipeline = Pipeline(
         [
             ("scaler", RobustScaler()),
@@ -556,8 +559,8 @@ y_pred_after[L.C2][Label.L1] = pipeline.predict(X_test[L.C2][Label.L1].drop(ID, 
 
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
-    # model = svm.SVC(kernel="rbf", C=100, gamma='scale', random_state=RNG)
-    model = CatBoostClassifier(random_state=RNG_SEED)  # 4m
+    model = svm.SVC(kernel="rbf", C=100, gamma="scale", random_state=RNG, probability=True)  # 1m
+    # model = CatBoostClassifier(random_state=RNG_SEED)  # 4m
     pipeline = Pipeline(
         [
             ("scaler", RobustScaler()),
@@ -566,7 +569,7 @@ if RETRAIN:
         ]
     )
     log("Training...")
-    pipeline.fit(X_train[L.C2][Label.L2], y_train[L.C2][Label.L2])  # 4m
+    pipeline.fit(X_train[L.C2][Label.L2], y_train[L.C2][Label.L2])  # 1m
     save_model(pipeline, "c2_label_2_after")
 else:
     pipeline = load_model("c2_label_2_after")
@@ -580,7 +583,7 @@ y_pred_after[L.C2][Label.L2] = pipeline.predict(X_test[L.C2][Label.L2].drop(ID, 
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
     # model = CatBoostClassifier(iterations=300, loss_function="MultiClass", max_depth=6, random_state=RNG_SEED)
-    model = svm.SVC(kernel="rbf", gamma="scale", C=1, random_state=RNG)  # 20s
+    model = svm.SVC(kernel="rbf", gamma="scale", C=1, random_state=RNG, probability=True)  # 20s
     pipeline = Pipeline(
         [
             ("scaler", RobustScaler()),
@@ -602,7 +605,7 @@ y_pred_after[L.C2][Label.L3] = pipeline.predict(X_test[L.C2][Label.L3].drop(ID, 
 
 if RETRAIN:
     transformers = get_transformers(pca_count=1)
-    model = svm.SVC(kernel="rbf", C=100, class_weight="balanced", random_state=RNG)
+    model = svm.SVC(kernel="rbf", C=100, class_weight="balanced", random_state=RNG, probability=True)  # 1m
     # model = CatBoostClassifier(random_state=RNG_SEED)
     pipeline = Pipeline(
         [
@@ -636,7 +639,7 @@ print("y_pred[layer-12][label_1]:", y_pred_after[L.C2][Label.L1].shape)
 
 result1 = pd.DataFrame(columns=[ID] + LABELS)
 result1[ID] = X_test[L.C1][Label.L1][ID]
-for label in Label:
+for label in [Label.L1, Label.L2, Label.L3, Label.L4]:
     result1[label.value] = y_pred_after[L.C1][label].astype(int)
 
 
@@ -645,7 +648,7 @@ for label in Label:
 
 result2 = pd.DataFrame(columns=[ID] + LABELS)
 result2[ID] = X_test[L.C2][Label.L1][ID]
-for label in Label:
+for label in [Label.L1, Label.L2, Label.L3, Label.L4]:
     result2[label.value] = y_pred_after[L.C2][label].astype(int)
 
 
@@ -671,4 +674,45 @@ result1.to_csv("results/layer-7.csv", index=False)
 
 
 result2.to_csv("results/layer-12.csv", index=False)
+
+
+# ## XAI
+# 
+# - Using Local Interpretable Model-Agnostic Explanations (LIME)
+
+# In[ ]:
+
+
+import lime
+import lime.lime_tabular
+
+
+# ### Competition 1 (layer 7)
+
+# #### Label 1
+
+# In[ ]:
+
+
+model = load_model("c1_label_1_after")  # Use pre-trained model
+
+explainer = lime.lime_tabular.LimeTabularExplainer(
+    X_train[L.C1][Label.L1].values,
+    feature_names=FEATURES,
+    class_names=list(map(str, range(1, 61))),  # Range of speaker IDs
+    discretize_continuous=True,
+    random_state=RNG_SEED,
+)
+
+i = np.random.randint(0, X_valid[L.C1][Label.L1].shape[0])
+exp = explainer.explain_instance(
+    X_valid[L.C1][Label.L1].values[i],
+    model.predict_proba,  # Requires model to be trained to predict probabilities
+    num_features=10,
+    top_labels=1,  # For multi class
+)
+
+print("Instance ID:", X_valid[L.C1][Label.L1].index[i])
+exp.save_to_file(f"results/layer-7-label-1-{i}.html")
+exp.show_in_notebook(show_table=True, show_all=False)
 
